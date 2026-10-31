@@ -15,6 +15,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
 from dotenv import load_dotenv
+from aiogram.types import FSInputFile
 
 load_dotenv()
 
@@ -238,12 +239,14 @@ async def choose_download(callback: CallbackQuery):
         await bot.send_chat_action(callback.message.chat.id, ChatAction.UPLOAD_DOCUMENT)
         if mode == "audio":
             await callback.message.answer_audio(
-                audio=path, title=title[:64], caption=f"🎵 {title}"
+             audio=FSInputFile(path),
+             title=title,
+             caption=f"🎵 {title}"
             )
         else:
             # Envia como documento para preservar o arquivo sem recodificação do Telegram.
             await callback.message.answer_document(
-                document=path, caption=f"🎬 {title}"
+             document=FSInputFile(path), caption=f"🎬 {title}"
             )
         await callback.message.answer("Pronto. Pode mandar outro link.")
     except Exception as exc:
