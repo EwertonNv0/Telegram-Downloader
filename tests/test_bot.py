@@ -4,7 +4,7 @@ import socket
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, call, patch
 
 os.environ["BOT_TOKEN"] = "123456:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 os.environ["ALLOWED_USER_IDS"] = "123456789"
@@ -128,8 +128,8 @@ class ConfigurationAndDownloadTests(unittest.TestCase):
                 self.assertTrue(first[0].is_file())
                 self.assertTrue(second[0].is_file())
             finally:
-                first[2].cleanup()
-                second[2].cleanup()
+                bot.cleanup_download_directory(first[2])
+                bot.cleanup_download_directory(second[2])
 
     def test_startup_cleanup_removes_only_known_temporary_download_directories(self):
         with tempfile.TemporaryDirectory() as root:
@@ -145,14 +145,46 @@ class ConfigurationAndDownloadTests(unittest.TestCase):
             preserved_dir.mkdir()
             preserved_file = root_path / "notes.txt"
             preserved_file.write_text("keep")
+            active_dir = root_path / "td-active"
+            active_dir.mkdir()
+            with bot.active_download_dirs_lock:
+                bot.active_download_dirs.add(active_dir.resolve())
 
             with patch.object(bot, "TEMP_DIR", root_path):
-                bot.cleanup_stale_downloads()
+                try:
+                    bot.cleanup_stale_downloads()
+                finally:
+                    with bot.active_download_dirs_lock:
+                        bot.active_download_dirs.discard(active_dir.resolve())
 
             for path in stale_dirs:
                 self.assertFalse(path.exists())
             self.assertTrue(preserved_dir.is_dir())
             self.assertTrue(preserved_file.is_file())
+            self.assertTrue(active_dir.is_dir())
+
+    def test_periodic_cleanup_runs_every_two_hours(self):
+        async def run_cleanup():
+            with (
+                patch(
+                    "bot.asyncio.sleep",
+                    new_callable=AsyncMock,
+                    side_effect=[None, asyncio.CancelledError],
+                ) as sleep,
+                patch("bot.asyncio.to_thread") as to_thread,
+                self.assertRaises(asyncio.CancelledError),
+            ):
+                await bot.cleanup_stale_downloads_periodically()
+            self.assertEqual(
+                sleep.await_args_list,
+                [
+                    call(bot.DOWNLOAD_CLEANUP_INTERVAL_SECONDS),
+                    call(bot.DOWNLOAD_CLEANUP_INTERVAL_SECONDS),
+                ],
+            )
+            to_thread.assert_awaited_once_with(bot.cleanup_stale_downloads)
+
+        asyncio.run(run_cleanup())
 
     def test_expired_pending_requests_are_removed(self):
         bot.pending.clear()

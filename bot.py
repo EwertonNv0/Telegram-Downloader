@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import socket
+import threading
 import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -57,6 +58,8 @@ DOWNLOAD_LIMIT_BYTES = min(
     MAX_FILE_BYTES, TELEGRAM_UPLOAD_LIMIT_MB * 1024 * 1024
 )
 PENDING_TTL_SECONDS = 30 * 60
+DOWNLOAD_CLEANUP_INTERVAL_SECONDS = 2 * 60 * 60
+DOWNLOAD_TEMP_PREFIXES = ("td-", "telegram-download-")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("media-bot")
@@ -79,6 +82,8 @@ dp = Dispatcher()
 download_slots = asyncio.Semaphore(2)
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 pending: dict[tuple[int, int], tuple[str, float]] = {}
+active_download_dirs: set[Path] = set()
+active_download_dirs_lock = threading.Lock()
 
 
 class DownloadTooLarge(Exception):
@@ -161,46 +166,73 @@ def inspect_media(url: str):
 
 def cleanup_stale_downloads() -> None:
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
-    prefixes = ("td-", "telegram-download-")
-    for path in TEMP_DIR.iterdir():
-        if path.is_dir() and path.name.startswith(prefixes):
-            try:
-                shutil.rmtree(path)
-            except OSError:
-                log.exception("Falha ao remover pasta temporária antiga: %s", path)
+    with active_download_dirs_lock:
+        for path in TEMP_DIR.iterdir():
+            if (
+                path.is_dir()
+                and path.name.startswith(DOWNLOAD_TEMP_PREFIXES)
+                and path.resolve() not in active_download_dirs
+            ):
+                try:
+                    shutil.rmtree(path)
+                except OSError:
+                    log.exception("Falha ao remover pasta temporária antiga: %s", path)
+
+
+def cleanup_download_directory(job_dir: TemporaryDirectory) -> None:
+    job_path = Path(job_dir.name).resolve()
+    try:
+        job_dir.cleanup()
+    except OSError:
+        log.exception("Falha ao limpar arquivos temporários do download")
+    finally:
+        with active_download_dirs_lock:
+            active_download_dirs.discard(job_path)
+
+
+async def cleanup_stale_downloads_periodically() -> None:
+    while True:
+        await asyncio.sleep(DOWNLOAD_CLEANUP_INTERVAL_SECONDS)
+        try:
+            await asyncio.to_thread(cleanup_stale_downloads)
+        except OSError:
+            log.exception("Falha ao verificar pastas temporárias antigas")
 
 
 def download_media(url: str, mode: str, quality: str):
     if not validate_url(url):
         raise ValueError("O endereço não aponta para um host público.")
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
-    job_dir = TemporaryDirectory(prefix="td-", dir=TEMP_DIR)
-    opts = ydl_base()
-    opts["outtmpl"] = str(Path(job_dir.name) / "%(id)s.%(ext)s")
-    opts["noplaylist"] = True
-    opts["overwrites"] = True
-
-    if mode == "audio":
-        opts.update(
-            {
-                "format": "bestaudio/best",
-                "postprocessors": [
-                    {
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        "preferredquality": "192",
-                    }
-                ],
-            }
-        )
-    else:
-        if quality == "best":
-            opts["format"] = "bestvideo+bestaudio/best"
-        else:
-            opts["format"] = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
-        opts["merge_output_format"] = "mp4"
+    with active_download_dirs_lock:
+        job_dir = TemporaryDirectory(prefix="td-", dir=TEMP_DIR)
+        active_download_dirs.add(Path(job_dir.name).resolve())
 
     try:
+        opts = ydl_base()
+        opts["outtmpl"] = str(Path(job_dir.name) / "%(id)s.%(ext)s")
+        opts["noplaylist"] = True
+        opts["overwrites"] = True
+
+        if mode == "audio":
+            opts.update(
+                {
+                    "format": "bestaudio/best",
+                    "postprocessors": [
+                        {
+                            "key": "FFmpegExtractAudio",
+                            "preferredcodec": "mp3",
+                            "preferredquality": "192",
+                        }
+                    ],
+                }
+            )
+        else:
+            if quality == "best":
+                opts["format"] = "bestvideo+bestaudio/best"
+            else:
+                opts["format"] = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
+            opts["merge_output_format"] = "mp4"
+
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
             filepath = Path(ydl.prepare_filename(info))
@@ -216,10 +248,7 @@ def download_media(url: str, mode: str, quality: str):
                     filepath = Path(requested[0]["filepath"])
             return filepath, info, job_dir
     except Exception:
-        try:
-            job_dir.cleanup()
-        except OSError:
-            log.exception("Falha ao limpar arquivos temporários após erro no download")
+        cleanup_download_directory(job_dir)
         raise
 
 
@@ -365,10 +394,7 @@ async def choose_download(callback: CallbackQuery):
         await callback.message.answer("Não consegui concluir o download. Confira o link e tente novamente.")
     finally:
         if job_dir is not None:
-            try:
-                job_dir.cleanup()
-            except OSError:
-                log.exception("Falha ao limpar arquivos temporários do download")
+            cleanup_download_directory(job_dir)
         try:
             await callback.message.delete()
         except TelegramBadRequest:
@@ -381,7 +407,15 @@ async def main():
         raise RuntimeError("FFmpeg não encontrado no PATH. Instale-o antes de iniciar o bot.")
     cleanup_stale_downloads()
     log.info("Bot iniciado. Quantidade de usuários autorizados: %d", len(ALLOWED_USER_IDS))
-    await dp.start_polling(bot)
+    cleanup_task = asyncio.create_task(cleanup_stale_downloads_periodically())
+    try:
+        await dp.start_polling(bot)
+    finally:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
 
 
 if __name__ == "__main__":

@@ -31,7 +31,7 @@ Não compartilhe o token do bot. Se ele vazar, gere outro pelo BotFather.
 ## Observações
 
 - O bot valida os endereços públicos antes da análise e do download, mas sites podem redirecionar requisições. Para uso com usuários não confiáveis, restrinja também a saída de rede da máquina para impedir acesso a redes privadas; validação na aplicação não substitui firewall.
-- Cada download usa uma pasta temporária exclusiva e nomes curtos para evitar limites de caminho do Windows. A pasta é removida após o envio; sobras de interrupções inesperadas com os prefixos `td-` e `telegram-download-` são removidas ao iniciar o bot.
+- Cada download usa uma pasta temporária exclusiva e nomes curtos para evitar limites de caminho do Windows. A pasta é removida após o envio; sobras de interrupções inesperadas com os prefixos `td-` e `telegram-download-` são removidas ao iniciar o bot e a cada duas horas. A rotina preserva pastas de downloads ativos.
 - O bot não contorna paywalls, DRM, autenticação ou controles de acesso.
 - O suporte depende dos extratores disponíveis no yt-dlp e das mudanças dos próprios sites.
 - `MAX_FILE_MB` limita o tamanho baixado, mas a Bot API hospedada pelo Telegram aceita arquivos de até 49 MB. Para enviar arquivos maiores, configure uma Bot API local e defina `TELEGRAM_API_BASE_URL` com o endereço dela; o limite local de envio é de até 2000 MB. Por exemplo, com `MAX_FILE_MB=1024`, o bot aceita até 1 GB quando ligado à API local.
