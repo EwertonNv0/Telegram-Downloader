@@ -12,6 +12,8 @@ from urllib.parse import urlparse
 
 import yt_dlp
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.enums import ChatAction
 from aiogram.filters import Command, CommandStart
@@ -33,6 +35,9 @@ ALLOWED_USER_IDS = {
     if value.strip().isdigit()
 }
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "downloads")).resolve()
+TEMP_DIR_SETTING = os.getenv("TEMP_DIR", "").strip()
+TEMP_DIR = Path(TEMP_DIR_SETTING).resolve() if TEMP_DIR_SETTING else DOWNLOAD_DIR
+TELEGRAM_API_BASE_URL = os.getenv("TELEGRAM_API_BASE_URL", "").strip().rstrip("/")
 
 
 def parse_max_file_mb(value: str) -> int:
@@ -47,6 +52,10 @@ def parse_max_file_mb(value: str) -> int:
 
 MAX_FILE_MB = parse_max_file_mb(os.getenv("MAX_FILE_MB", "49"))
 MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
+TELEGRAM_UPLOAD_LIMIT_MB = 2000 if TELEGRAM_API_BASE_URL else 49
+DOWNLOAD_LIMIT_BYTES = min(
+    MAX_FILE_BYTES, TELEGRAM_UPLOAD_LIMIT_MB * 1024 * 1024
+)
 PENDING_TTL_SECONDS = 30 * 60
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -57,7 +66,15 @@ if not BOT_TOKEN:
 if not ALLOWED_USER_IDS:
     raise RuntimeError("Configure pelo menos um ID em ALLOWED_USER_IDS no arquivo .env.")
 
-bot = Bot(BOT_TOKEN)
+
+def create_bot(token: str, api_base_url: str = "") -> Bot:
+    if not api_base_url:
+        return Bot(token)
+    local_api = TelegramAPIServer.from_base(api_base_url, is_local=True)
+    return Bot(token, session=AiohttpSession(api=local_api))
+
+
+bot = create_bot(BOT_TOKEN, TELEGRAM_API_BASE_URL)
 dp = Dispatcher()
 download_slots = asyncio.Semaphore(2)
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
@@ -102,9 +119,19 @@ def check_download_size(status: dict) -> None:
     downloaded_bytes = status.get("downloaded_bytes") or 0
     if (
         status.get("status") == "downloading"
-        and downloaded_bytes > MAX_FILE_BYTES
+        and downloaded_bytes > DOWNLOAD_LIMIT_BYTES
     ):
-        raise DownloadTooLarge(f"O download ultrapassou o limite de {MAX_FILE_MB} MB.")
+        if not TELEGRAM_API_BASE_URL and MAX_FILE_BYTES > DOWNLOAD_LIMIT_BYTES:
+            raise DownloadTooLarge(
+                "Este bot limita os envios pela Bot API hospedada pelo Telegram a 49 MB "
+                "para evitar o limite oficial de 50 MB. "
+                f"MAX_FILE_MB está em {MAX_FILE_MB} MB; configure "
+                "TELEGRAM_API_BASE_URL com uma Bot API local para enviar arquivos maiores."
+            )
+        raise DownloadTooLarge(
+            f"O download ultrapassou o limite efetivo de "
+            f"{DOWNLOAD_LIMIT_BYTES // (1024 * 1024)} MB."
+        )
 
 
 def ydl_base():
@@ -118,7 +145,7 @@ def ydl_base():
         "fragment_retries": 2,
         "extractor_retries": 1,
         "ffmpeg_location": shutil.which("ffmpeg") or None,
-        "max_filesize": MAX_FILE_BYTES,
+        "max_filesize": DOWNLOAD_LIMIT_BYTES,
         "progress_hooks": [check_download_size],
     }
 
@@ -135,10 +162,10 @@ def inspect_media(url: str):
 def download_media(url: str, mode: str, quality: str):
     if not validate_url(url):
         raise ValueError("O endereço não aponta para um host público.")
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    job_dir = TemporaryDirectory(prefix="telegram-download-", dir=DOWNLOAD_DIR)
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    job_dir = TemporaryDirectory(prefix="td-", dir=TEMP_DIR)
     opts = ydl_base()
-    opts["outtmpl"] = str(Path(job_dir.name) / "%(title).120B-%(id)s.%(ext)s")
+    opts["outtmpl"] = str(Path(job_dir.name) / "%(id)s.%(ext)s")
     opts["noplaylist"] = True
     opts["overwrites"] = True
 
@@ -301,10 +328,9 @@ async def choose_download(callback: CallbackQuery):
         if not path.exists():
             raise FileNotFoundError("O download terminou, mas o arquivo final não foi localizado.")
         size = path.stat().st_size
-        if size > MAX_FILE_BYTES:
-            raise DownloadTooLarge(
-                f"O arquivo tem {size / (1024*1024):.1f} MB e ultrapassa o limite de "
-                f"{MAX_FILE_MB} MB. Reduza a qualidade ou use um servidor Bot API local."
+        if size > DOWNLOAD_LIMIT_BYTES:
+            check_download_size(
+                {"status": "downloading", "downloaded_bytes": size}
             )
 
         title = (info.get("title") or path.name)[:900]

@@ -1,3 +1,4 @@
+import asyncio
 import os
 import socket
 import tempfile
@@ -59,6 +60,34 @@ class ConfigurationAndDownloadTests(unittest.TestCase):
                 {"status": "downloading", "downloaded_bytes": bot.MAX_FILE_BYTES + 1}
             )
 
+    def test_cloud_api_limit_is_applied_even_when_download_limit_is_1gb(self):
+        configured_limit = 1024 * 1024 * 1024
+        cloud_limit = 49 * 1024 * 1024
+        self.assertEqual(min(configured_limit, cloud_limit), cloud_limit)
+        with (
+            patch.object(bot, "TELEGRAM_API_BASE_URL", ""),
+            patch.object(bot, "MAX_FILE_MB", 1024),
+            patch.object(bot, "MAX_FILE_BYTES", configured_limit),
+            patch.object(bot, "DOWNLOAD_LIMIT_BYTES", cloud_limit),
+            self.assertRaises(bot.DownloadTooLarge) as error,
+        ):
+            bot.check_download_size({"status": "downloading", "downloaded_bytes": cloud_limit + 1})
+        self.assertIn("Bot API", str(error.exception))
+
+    def test_local_api_configuration_uses_aiogram_local_api_server(self):
+        local_bot = bot.create_bot(
+            "123456:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "http://127.0.0.1:8081",
+        )
+        try:
+            self.assertTrue(local_bot.session.api.is_local)
+            self.assertEqual(
+                local_bot.session.api.base,
+                "http://127.0.0.1:8081/bot{token}/{method}",
+            )
+        finally:
+            asyncio.run(local_bot.session.close())
+
     def test_downloads_with_the_same_title_use_distinct_directories(self):
         class FakeYoutubeDL:
             def __init__(self, options):
@@ -72,9 +101,10 @@ class ConfigurationAndDownloadTests(unittest.TestCase):
 
             def extract_info(self, _url, download):
                 assert download
+                self.outtmpl = self.options["outtmpl"]
                 self.output = self.options["outtmpl"].replace(
-                    "%(title).120B", "same-title"
-                ).replace("%(id)s", "same-id").replace("%(ext)s", "mp4")
+                    "%(id)s", "same-id"
+                ).replace("%(ext)s", "mp4")
                 Path(self.output).write_bytes(b"file")
                 return {"title": "same-title", "id": "same-id", "ext": "mp4"}
 
@@ -84,6 +114,7 @@ class ConfigurationAndDownloadTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             with (
                 patch.object(bot, "DOWNLOAD_DIR", Path(root)),
+                patch.object(bot, "TEMP_DIR", Path(root)),
                 patch.object(bot, "validate_url", return_value=True),
                 patch.object(bot.yt_dlp, "YoutubeDL", FakeYoutubeDL),
             ):
@@ -92,6 +123,8 @@ class ConfigurationAndDownloadTests(unittest.TestCase):
 
             try:
                 self.assertNotEqual(first[0].parent, second[0].parent)
+                self.assertLess(len(first[0].name), 32)
+                self.assertLess(len(first[0].parent.name), 12)
                 self.assertTrue(first[0].is_file())
                 self.assertTrue(second[0].is_file())
             finally:
