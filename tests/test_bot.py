@@ -131,6 +131,29 @@ class ConfigurationAndDownloadTests(unittest.TestCase):
                 first[2].cleanup()
                 second[2].cleanup()
 
+    def test_startup_cleanup_removes_only_known_temporary_download_directories(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            stale_dirs = (
+                root_path / "td-abandoned",
+                root_path / "telegram-download-abandoned",
+            )
+            for path in stale_dirs:
+                path.mkdir()
+                (path / "partial.mp4.part").write_bytes(b"partial")
+            preserved_dir = root_path / "user-files"
+            preserved_dir.mkdir()
+            preserved_file = root_path / "notes.txt"
+            preserved_file.write_text("keep")
+
+            with patch.object(bot, "TEMP_DIR", root_path):
+                bot.cleanup_stale_downloads()
+
+            for path in stale_dirs:
+                self.assertFalse(path.exists())
+            self.assertTrue(preserved_dir.is_dir())
+            self.assertTrue(preserved_file.is_file())
+
     def test_expired_pending_requests_are_removed(self):
         bot.pending.clear()
         bot.pending[(1, 1)] = ("https://example.com", 0)

@@ -159,6 +159,17 @@ def inspect_media(url: str):
         return ydl.extract_info(url, download=False)
 
 
+def cleanup_stale_downloads() -> None:
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    prefixes = ("td-", "telegram-download-")
+    for path in TEMP_DIR.iterdir():
+        if path.is_dir() and path.name.startswith(prefixes):
+            try:
+                shutil.rmtree(path)
+            except OSError:
+                log.exception("Falha ao remover pasta temporária antiga: %s", path)
+
+
 def download_media(url: str, mode: str, quality: str):
     if not validate_url(url):
         raise ValueError("O endereço não aponta para um host público.")
@@ -368,6 +379,7 @@ async def main():
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     if not shutil.which("ffmpeg"):
         raise RuntimeError("FFmpeg não encontrado no PATH. Instale-o antes de iniciar o bot.")
+    cleanup_stale_downloads()
     log.info("Bot iniciado. Quantidade de usuários autorizados: %d", len(ALLOWED_USER_IDS))
     await dp.start_polling(bot)
 
