@@ -8,14 +8,18 @@ import socket
 import threading
 import time
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import mkdtemp
 from urllib.parse import urlparse
 
 import yt_dlp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramNetworkError,
+    TelegramServerError,
+)
 from aiogram.enums import ChatAction
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
@@ -60,6 +64,12 @@ DOWNLOAD_LIMIT_BYTES = min(
 PENDING_TTL_SECONDS = 30 * 60
 DOWNLOAD_CLEANUP_INTERVAL_SECONDS = 2 * 60 * 60
 DOWNLOAD_TEMP_PREFIXES = ("td-", "telegram-download-")
+TELEGRAM_SESSION_TIMEOUT_SECONDS = 120
+TELEGRAM_REQUEST_TIMEOUT_SECONDS = 30 * 60
+TELEGRAM_UPLOAD_MAX_ATTEMPTS = 3
+TELEGRAM_UPLOAD_RETRY_BASE_SECONDS = 2
+DOWNLOAD_CLEANUP_MAX_ATTEMPTS = 4
+DOWNLOAD_CLEANUP_RETRY_BASE_SECONDS = 0.25
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("media-bot")
@@ -72,9 +82,15 @@ if not ALLOWED_USER_IDS:
 
 def create_bot(token: str, api_base_url: str = "") -> Bot:
     if not api_base_url:
-        return Bot(token)
+        return Bot(token, session=AiohttpSession(timeout=TELEGRAM_SESSION_TIMEOUT_SECONDS))
     local_api = TelegramAPIServer.from_base(api_base_url, is_local=True)
-    return Bot(token, session=AiohttpSession(api=local_api))
+    return Bot(
+        token,
+        session=AiohttpSession(
+            api=local_api,
+            timeout=TELEGRAM_SESSION_TIMEOUT_SECONDS,
+        ),
+    )
 
 
 bot = create_bot(BOT_TOKEN, TELEGRAM_API_BASE_URL)
@@ -166,28 +182,89 @@ def inspect_media(url: str):
 
 def cleanup_stale_downloads() -> None:
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    stale_before = time.time() - DOWNLOAD_CLEANUP_INTERVAL_SECONDS
+    stale_paths = []
     with active_download_dirs_lock:
         for path in TEMP_DIR.iterdir():
-            if (
-                path.is_dir()
-                and path.name.startswith(DOWNLOAD_TEMP_PREFIXES)
-                and path.resolve() not in active_download_dirs
-            ):
-                try:
-                    shutil.rmtree(path)
-                except OSError:
-                    log.exception("Falha ao remover pasta temporária antiga: %s", path)
+            if not path.is_dir() or not path.name.startswith(DOWNLOAD_TEMP_PREFIXES):
+                continue
+            try:
+                job_path = path.resolve()
+                if job_path in active_download_dirs or path.stat().st_mtime > stale_before:
+                    continue
+                stale_paths.append(path)
+            except OSError:
+                log.exception("Falha ao verificar pasta temporária antiga: %s", path)
+    for path in stale_paths:
+        cleanup_download_directory(path)
 
 
-def cleanup_download_directory(job_dir: TemporaryDirectory) -> None:
-    job_path = Path(job_dir.name).resolve()
-    try:
-        job_dir.cleanup()
-    except OSError:
-        log.exception("Falha ao limpar arquivos temporários do download")
-    finally:
-        with active_download_dirs_lock:
-            active_download_dirs.discard(job_path)
+def release_download_directory(job_dir: Path) -> None:
+    if job_dir.is_dir():
+        try:
+            os.utime(job_dir, None)
+        except OSError:
+            log.exception("Falha ao atualizar a idade da pasta temporária: %s", job_dir)
+    with active_download_dirs_lock:
+        active_download_dirs.discard(job_dir.resolve())
+
+
+def cleanup_download_directory(job_dir: Path) -> bool:
+    job_path = job_dir.resolve()
+    for attempt in range(1, DOWNLOAD_CLEANUP_MAX_ATTEMPTS + 1):
+        try:
+            try:
+                shutil.rmtree(job_dir)
+            except FileNotFoundError:
+                pass
+            release_download_directory(job_path)
+            return True
+        except OSError:
+            if attempt == DOWNLOAD_CLEANUP_MAX_ATTEMPTS:
+                log.exception("Falha ao limpar arquivos temporários do download: %s", job_dir)
+            else:
+                delay = DOWNLOAD_CLEANUP_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+                log.warning(
+                    "Arquivo temporário bloqueado; nova tentativa de limpeza %d/%d em %.2f s: %s",
+                    attempt,
+                    DOWNLOAD_CLEANUP_MAX_ATTEMPTS - 1,
+                    delay,
+                    job_dir,
+                )
+                time.sleep(delay)
+    release_download_directory(job_path)
+    return False
+
+
+async def send_media_with_retries(message: Message, path: Path, mode: str, title: str) -> None:
+    for attempt in range(1, TELEGRAM_UPLOAD_MAX_ATTEMPTS + 1):
+        try:
+            if mode == "audio":
+                await message.answer_audio(
+                    audio=FSInputFile(path),
+                    title=title,
+                    caption=f"🎵 {title}",
+                    request_timeout=TELEGRAM_REQUEST_TIMEOUT_SECONDS,
+                )
+            else:
+                await message.answer_document(
+                    document=FSInputFile(path),
+                    caption=f"🎬 {title}",
+                    request_timeout=TELEGRAM_REQUEST_TIMEOUT_SECONDS,
+                )
+            return
+        except (TelegramNetworkError, TelegramServerError, asyncio.TimeoutError):
+            if attempt == TELEGRAM_UPLOAD_MAX_ATTEMPTS:
+                raise
+            delay = TELEGRAM_UPLOAD_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+            log.warning(
+                "Falha transitória no envio ao Telegram; tentativa %d/%d em %d s",
+                attempt + 1,
+                TELEGRAM_UPLOAD_MAX_ATTEMPTS,
+                delay,
+                exc_info=True,
+            )
+            await asyncio.sleep(delay)
 
 
 async def cleanup_stale_downloads_periodically() -> None:
@@ -204,12 +281,12 @@ def download_media(url: str, mode: str, quality: str):
         raise ValueError("O endereço não aponta para um host público.")
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
     with active_download_dirs_lock:
-        job_dir = TemporaryDirectory(prefix="td-", dir=TEMP_DIR)
-        active_download_dirs.add(Path(job_dir.name).resolve())
+        job_dir = Path(mkdtemp(prefix="td-", dir=TEMP_DIR)).resolve()
+        active_download_dirs.add(job_dir)
 
     try:
         opts = ydl_base()
-        opts["outtmpl"] = str(Path(job_dir.name) / "%(id)s.%(ext)s")
+        opts["outtmpl"] = str(job_dir / "%(id)s.%(ext)s")
         opts["noplaylist"] = True
         opts["overwrites"] = True
 
@@ -361,40 +438,68 @@ async def choose_download(callback: CallbackQuery):
     await callback.answer("Download iniciado.")
     await callback.message.edit_text("⏬ Baixando e preparando o arquivo...")
     job_dir = None
+    preserve_download = False
     try:
-        async with download_slots:
-            path, info, job_dir = await asyncio.to_thread(download_media, url, mode, quality)
+        try:
+            async with download_slots:
+                path, info, job_dir = await asyncio.to_thread(download_media, url, mode, quality)
+        except DownloadTooLarge as exc:
+            await callback.message.answer(str(exc))
+            return
+        except yt_dlp.utils.PostProcessingError:
+            log.exception("Falha no processamento da mídia pelo FFmpeg/yt-dlp")
+            await callback.message.answer("A mídia foi baixada, mas não consegui processar o arquivo.")
+            return
+        except Exception:
+            log.exception("Falha no download da mídia")
+            await callback.message.answer("Não consegui baixar o arquivo. Confira o link e tente novamente.")
+            return
 
-        if not path.exists():
-            raise FileNotFoundError("O download terminou, mas o arquivo final não foi localizado.")
-        size = path.stat().st_size
-        if size > DOWNLOAD_LIMIT_BYTES:
-            check_download_size(
-                {"status": "downloading", "downloaded_bytes": size}
-            )
+        try:
+            if not path.is_file():
+                raise FileNotFoundError("O download terminou, mas o arquivo final não foi localizado.")
+            size = path.stat().st_size
+            if size > DOWNLOAD_LIMIT_BYTES:
+                check_download_size(
+                    {"status": "downloading", "downloaded_bytes": size}
+                )
+            title = (info.get("title") or path.name)[:900]
+        except DownloadTooLarge as exc:
+            await callback.message.answer(str(exc))
+            return
+        except Exception:
+            log.exception("Falha ao preparar o arquivo baixado")
+            await callback.message.answer("O download terminou, mas não consegui preparar o arquivo para envio.")
+            return
 
-        title = (info.get("title") or path.name)[:900]
-        await bot.send_chat_action(callback.message.chat.id, ChatAction.UPLOAD_DOCUMENT)
-        if mode == "audio":
-            await callback.message.answer_audio(
-                audio=FSInputFile(path),
-                title=title,
-                caption=f"🎵 {title}",
+        try:
+            try:
+                await bot.send_chat_action(
+                    callback.message.chat.id,
+                    ChatAction.UPLOAD_DOCUMENT,
+                )
+            except (TelegramNetworkError, TelegramServerError, asyncio.TimeoutError):
+                log.warning("Falha ao notificar início do envio; vou tentar enviar a mídia mesmo assim", exc_info=True)
+            await send_media_with_retries(callback.message, path, mode, title)
+        except asyncio.CancelledError:
+            preserve_download = True
+            log.warning("Envio cancelado; arquivo temporário preservado em %s", path)
+            raise
+        except Exception:
+            preserve_download = True
+            log.exception("Falha no envio ao Telegram; download preservado em %s", path)
+            await callback.message.answer(
+                "O arquivo foi baixado, mas não consegui enviá-lo ao Telegram. "
+                "Mantive o arquivo temporariamente no servidor."
             )
-        else:
-            # Envia como documento para preservar o arquivo sem recodificação do Telegram.
-            await callback.message.answer_document(
-                document=FSInputFile(path), caption=f"🎬 {title}"
-            )
+            return
         await callback.message.answer("Pronto. Pode mandar outro link.")
-    except DownloadTooLarge as exc:
-        await callback.message.answer(str(exc))
-    except Exception:
-        log.exception("Falha no download")
-        await callback.message.answer("Não consegui concluir o download. Confira o link e tente novamente.")
     finally:
         if job_dir is not None:
-            cleanup_download_directory(job_dir)
+            if preserve_download:
+                release_download_directory(job_dir)
+            else:
+                await asyncio.to_thread(cleanup_download_directory, job_dir)
         try:
             await callback.message.delete()
         except TelegramBadRequest:

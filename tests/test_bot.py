@@ -1,10 +1,13 @@
 import asyncio
 import os
+import shutil
 import socket
+import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 os.environ["BOT_TOKEN"] = "123456:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 os.environ["ALLOWED_USER_IDS"] = "123456789"
@@ -88,6 +91,152 @@ class ConfigurationAndDownloadTests(unittest.TestCase):
         finally:
             asyncio.run(local_bot.session.close())
 
+    def test_bot_configures_a_long_request_timeout_for_large_uploads(self):
+        configured_bot = bot.create_bot("123456:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        try:
+            self.assertEqual(
+                configured_bot.session.timeout,
+                bot.TELEGRAM_SESSION_TIMEOUT_SECONDS,
+            )
+        finally:
+            asyncio.run(configured_bot.session.close())
+
+    def test_upload_retries_transient_network_failure_without_redownloading(self):
+        class FakeNetworkError(Exception):
+            pass
+
+        message = MagicMock()
+        message.answer_document = AsyncMock(
+            side_effect=[FakeNetworkError("timeout"), None]
+        )
+        path = Path("video.mp4")
+
+        async def send():
+            with (
+                patch.object(bot, "TelegramNetworkError", FakeNetworkError),
+                patch("bot.asyncio.sleep", new_callable=AsyncMock) as sleep,
+            ):
+                await bot.send_media_with_retries(message, path, "video", "Video")
+            sleep.assert_awaited_once_with(bot.TELEGRAM_UPLOAD_RETRY_BASE_SECONDS)
+            self.assertEqual(message.answer_document.await_count, 2)
+            self.assertEqual(
+                message.answer_document.await_args_list[0].kwargs["document"].path,
+                path,
+            )
+            self.assertEqual(
+                message.answer_document.await_args_list[1].kwargs["document"].path,
+                path,
+            )
+            self.assertEqual(
+                message.answer_document.await_args_list[0].kwargs["request_timeout"],
+                bot.TELEGRAM_REQUEST_TIMEOUT_SECONDS,
+            )
+
+        asyncio.run(send())
+
+    def test_cleanup_retries_temporary_windows_file_lock(self):
+        with tempfile.TemporaryDirectory() as root:
+            job_dir = Path(root) / "td-locked"
+            job_dir.mkdir()
+            with bot.active_download_dirs_lock:
+                bot.active_download_dirs.add(job_dir.resolve())
+
+            attempts = 0
+            actual_rmtree = shutil.rmtree
+
+            def rmtree_after_transient_lock(path):
+                nonlocal attempts
+                attempts += 1
+                if attempts < 3:
+                    raise PermissionError("file in use")
+                actual_rmtree(path)
+
+            with (
+                patch(
+                    "bot.shutil.rmtree",
+                    side_effect=rmtree_after_transient_lock,
+                ) as rmtree,
+                patch("bot.time.sleep"),
+            ):
+                self.assertTrue(bot.cleanup_download_directory(job_dir))
+            self.assertEqual(rmtree.call_count, 3)
+            self.assertFalse(job_dir.exists())
+            with bot.active_download_dirs_lock:
+                self.assertNotIn(job_dir.resolve(), bot.active_download_dirs)
+
+    def test_failed_cleanup_preserves_recent_file_for_periodic_retry(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            job_dir = root_path / "td-locked"
+            job_dir.mkdir()
+            partial = job_dir / "video.mp4"
+            partial.write_bytes(b"keep")
+            with bot.active_download_dirs_lock:
+                bot.active_download_dirs.add(job_dir.resolve())
+            with (
+                patch("bot.shutil.rmtree", side_effect=PermissionError("file in use")),
+                patch("bot.time.sleep"),
+                patch.object(bot, "TEMP_DIR", root_path),
+            ):
+                self.assertFalse(bot.cleanup_download_directory(job_dir))
+                bot.cleanup_stale_downloads()
+            self.assertTrue(partial.is_file())
+
+    def test_failed_telegram_upload_keeps_downloaded_file(self):
+        async def run_upload():
+            with tempfile.TemporaryDirectory() as root:
+                job_dir = Path(root) / "td-kept"
+                job_dir.mkdir()
+                video = job_dir / "video.mp4"
+                video.write_bytes(b"video")
+                with bot.active_download_dirs_lock:
+                    bot.active_download_dirs.add(job_dir.resolve())
+
+                callback = MagicMock()
+                callback.from_user.id = 123456789
+                callback.data = "video:best"
+                callback.message.message_id = 42
+                callback.message.chat.id = 99
+                callback.answer = AsyncMock()
+                callback.message.edit_text = AsyncMock()
+                callback.message.answer = AsyncMock()
+                callback.message.delete = AsyncMock()
+                bot.pending[(123456789, 42)] = (
+                    "https://example.com/video",
+                    time.monotonic(),
+                )
+                try:
+                    with (
+                        patch.object(
+                            bot,
+                            "download_media",
+                            return_value=(video, {"title": "Video"}, job_dir),
+                        ),
+                        patch.object(bot.bot, "send_chat_action", new_callable=AsyncMock),
+                        patch.object(
+                            bot,
+                            "send_media_with_retries",
+                            new_callable=AsyncMock,
+                            side_effect=RuntimeError("Telegram unavailable"),
+                        ),
+                    ):
+                        await bot.choose_download(callback)
+
+                    self.assertTrue(video.is_file())
+                    messages = [
+                        awaited_call.args[0]
+                        for awaited_call in callback.message.answer.await_args_list
+                    ]
+                    self.assertTrue(
+                        any("Mantive o arquivo temporariamente" in text for text in messages)
+                    )
+                    with bot.active_download_dirs_lock:
+                        self.assertNotIn(job_dir.resolve(), bot.active_download_dirs)
+                finally:
+                    bot.pending.pop((123456789, 42), None)
+
+        asyncio.run(run_upload())
+
     def test_downloads_with_the_same_title_use_distinct_directories(self):
         class FakeYoutubeDL:
             def __init__(self, options):
@@ -141,6 +290,8 @@ class ConfigurationAndDownloadTests(unittest.TestCase):
             for path in stale_dirs:
                 path.mkdir()
                 (path / "partial.mp4.part").write_bytes(b"partial")
+                stale_time = time.time() - bot.DOWNLOAD_CLEANUP_INTERVAL_SECONDS - 1
+                os.utime(path, (stale_time, stale_time))
             preserved_dir = root_path / "user-files"
             preserved_dir.mkdir()
             preserved_file = root_path / "notes.txt"
