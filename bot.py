@@ -1,21 +1,28 @@
 import asyncio
+import ipaddress
 import logging
 import os
 import re
 import shutil
 import socket
-import tempfile
+import time
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from urllib.parse import urlparse
 
 import yt_dlp
 from aiogram import Bot, Dispatcher, F
-from aiogram.enums import ChatAction
-from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.enums import ChatAction
+from aiogram.filters import Command, CommandStart
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from dotenv import load_dotenv
-from aiogram.types import FSInputFile
 
 load_dotenv()
 
@@ -26,8 +33,21 @@ ALLOWED_USER_IDS = {
     if value.strip().isdigit()
 }
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "downloads")).resolve()
-MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "49"))
+
+
+def parse_max_file_mb(value: str) -> int:
+    try:
+        max_file_mb = int(value)
+    except ValueError as exc:
+        raise RuntimeError("MAX_FILE_MB deve ser um número inteiro positivo.") from exc
+    if max_file_mb <= 0:
+        raise RuntimeError("MAX_FILE_MB deve ser um número inteiro positivo.")
+    return max_file_mb
+
+
+MAX_FILE_MB = parse_max_file_mb(os.getenv("MAX_FILE_MB", "49"))
 MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
+PENDING_TTL_SECONDS = 30 * 60
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("media-bot")
@@ -41,6 +61,11 @@ bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 download_slots = asyncio.Semaphore(2)
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+pending: dict[tuple[int, int], tuple[str, float]] = {}
+
+
+class DownloadTooLarge(Exception):
+    pass
 
 
 def is_authorized(user_id: int | None) -> bool:
@@ -48,25 +73,38 @@ def is_authorized(user_id: int | None) -> bool:
 
 
 def validate_url(url: str) -> bool:
-    """Aceita apenas URLs HTTP(S) públicas; bloqueia localhost e IPs privados."""
+    """Reject non-public HTTP(S) destinations before handing a URL to yt-dlp."""
     try:
         parsed = urlparse(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
             return False
-        host = parsed.hostname.lower()
+        host = parsed.hostname.rstrip(".").lower()
         if host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
             return False
-        try:
-            addresses = socket.getaddrinfo(host, None)
-            for item in addresses:
-                ip = item[4][0].split("%")[0]
-                if not __import__("ipaddress").ip_address(ip).is_global:
-                    return False
-        except socket.gaierror:
+        port = parsed.port
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        if not addresses:
             return False
-        return True
-    except Exception:
+        return all(
+            ipaddress.ip_address(item[4][0].split("%", 1)[0]).is_global
+            for item in addresses
+        )
+    except (OSError, ValueError):
         return False
+
+
+def check_download_size(status: dict) -> None:
+    downloaded_bytes = status.get("downloaded_bytes") or 0
+    if (
+        status.get("status") == "downloading"
+        and downloaded_bytes > MAX_FILE_BYTES
+    ):
+        raise DownloadTooLarge(f"O download ultrapassou o limite de {MAX_FILE_MB} MB.")
 
 
 def ydl_base():
@@ -80,10 +118,14 @@ def ydl_base():
         "fragment_retries": 2,
         "extractor_retries": 1,
         "ffmpeg_location": shutil.which("ffmpeg") or None,
+        "max_filesize": MAX_FILE_BYTES,
+        "progress_hooks": [check_download_size],
     }
 
 
 def inspect_media(url: str):
+    if not validate_url(url):
+        raise ValueError("O endereço não aponta para um host público.")
     opts = ydl_base()
     opts["skip_download"] = True
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -91,21 +133,28 @@ def inspect_media(url: str):
 
 
 def download_media(url: str, mode: str, quality: str):
+    if not validate_url(url):
+        raise ValueError("O endereço não aponta para um host público.")
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    job_dir = TemporaryDirectory(prefix="telegram-download-", dir=DOWNLOAD_DIR)
     opts = ydl_base()
-    opts["outtmpl"] = str(DOWNLOAD_DIR / "%(title).120B-%(id)s.%(ext)s")
+    opts["outtmpl"] = str(Path(job_dir.name) / "%(title).120B-%(id)s.%(ext)s")
     opts["noplaylist"] = True
     opts["overwrites"] = True
 
     if mode == "audio":
-        opts.update({
-            "format": "bestaudio/best",
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }],
-        })
+        opts.update(
+            {
+                "format": "bestaudio/best",
+                "postprocessors": [
+                    {
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": "192",
+                    }
+                ],
+            }
+        )
     else:
         if quality == "best":
             opts["format"] = "bestvideo+bestaudio/best"
@@ -113,21 +162,34 @@ def download_media(url: str, mode: str, quality: str):
             opts["format"] = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
         opts["merge_output_format"] = "mp4"
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        filepath = Path(ydl.prepare_filename(info))
-        if mode == "audio":
-            filepath = filepath.with_suffix(".mp3")
-        elif filepath.suffix.lower() != ".mp4":
-            candidate = filepath.with_suffix(".mp4")
-            if candidate.exists():
-                filepath = candidate
-        if not filepath.exists():
-            # Algumas fontes retornam o caminho final em requested_downloads.
-            requested = info.get("requested_downloads") or []
-            if requested and requested[0].get("filepath"):
-                filepath = Path(requested[0]["filepath"])
-        return filepath, info
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filepath = Path(ydl.prepare_filename(info))
+            if mode == "audio":
+                filepath = filepath.with_suffix(".mp3")
+            elif filepath.suffix.lower() != ".mp4":
+                candidate = filepath.with_suffix(".mp4")
+                if candidate.exists():
+                    filepath = candidate
+            if not filepath.exists():
+                requested = info.get("requested_downloads") or []
+                if requested and requested[0].get("filepath"):
+                    filepath = Path(requested[0]["filepath"])
+            return filepath, info, job_dir
+    except Exception:
+        try:
+            job_dir.cleanup()
+        except OSError:
+            log.exception("Falha ao limpar arquivos temporários após erro no download")
+        raise
+
+
+def cleanup_pending() -> None:
+    expiry = time.monotonic() - PENDING_TTL_SECONDS
+    for key, (_, created_at) in list(pending.items()):
+        if created_at < expiry:
+            pending.pop(key, None)
 
 
 def keyboard():
@@ -158,7 +220,7 @@ async def start(message: Message):
 @dp.message(Command("id"))
 async def show_id(message: Message):
     uid = message.from_user.id if message.from_user else "desconhecido"
-    await message.answer(f"Seu Telegram ID: `{uid}`", parse_mode="Markdown")
+    await message.answer(f"Seu Telegram ID: {uid}")
 
 
 @dp.message(Command("help"))
@@ -179,7 +241,7 @@ async def receive_link(message: Message):
         return
 
     url = match.group(0).rstrip(").,!?]}>")
-    if not validate_url(url):
+    if not await asyncio.to_thread(validate_url, url):
         await message.answer("Esse endereço não parece ser uma URL pública HTTP(S válida.")
         return
 
@@ -190,19 +252,15 @@ async def receive_link(message: Message):
         title = info.get("title") or "Mídia sem título"
         duration = info.get("duration")
         duration_text = f"\nDuração: {int(duration // 60)}:{int(duration % 60):02d}" if duration else ""
+        cleanup_pending()
         await status.edit_text(
-            f"**{title[:700]}**{duration_text}\n\nEscolha como deseja baixar:",
-            parse_mode="Markdown",
+            f"{title[:700]}{duration_text}\n\nEscolha como deseja baixar:",
             reply_markup=keyboard(),
         )
-        # Guarda a URL associada ao botão na memória do processo.
-        pending[(uid, status.message_id)] = url
-    except Exception as exc:
+        pending[(uid, status.message_id)] = (url, time.monotonic())
+    except Exception:
         log.exception("Falha ao analisar URL")
-        await status.edit_text(f"Não consegui analisar esse link.\n\nDetalhe: {str(exc)[:700]}")
-
-
-pending = {}
+        await status.edit_text("Não consegui analisar esse link. Confira a URL e tente novamente.")
 
 
 @dp.callback_query(F.data.startswith(("video:", "audio:")))
@@ -212,62 +270,79 @@ async def choose_download(callback: CallbackQuery):
         await callback.answer("Acesso não autorizado.", show_alert=True)
         return
 
-    key = (uid, callback.message.message_id if callback.message else -1)
-    url = pending.get(key)
-    if not url:
+    if callback.message is None or callback.data is None:
+        await callback.answer("Esse pedido expirou. Envie o link novamente.", show_alert=True)
+        return
+
+    key = (uid, callback.message.message_id)
+    request = pending.pop(key, None)
+    if request is None or time.monotonic() - request[1] > PENDING_TTL_SECONDS:
         await callback.answer("Esse pedido expirou. Envie o link novamente.", show_alert=True)
         return
 
     mode, quality = callback.data.split(":", 1)
+    if (mode, quality) not in {
+        ("audio", "mp3"),
+        ("video", "best"),
+        ("video", "720"),
+        ("video", "480"),
+    }:
+        await callback.answer("Opção inválida. Envie o link novamente.", show_alert=True)
+        return
+
+    url = request[0]
     await callback.answer("Download iniciado.")
     await callback.message.edit_text("⏬ Baixando e preparando o arquivo...")
-    path = None
+    job_dir = None
     try:
         async with download_slots:
-            path, info = await asyncio.to_thread(download_media, url, mode, quality)
+            path, info, job_dir = await asyncio.to_thread(download_media, url, mode, quality)
 
         if not path.exists():
             raise FileNotFoundError("O download terminou, mas o arquivo final não foi localizado.")
         size = path.stat().st_size
         if size > MAX_FILE_BYTES:
-            raise ValueError(
-                f"O arquivo tem {size / (1024*1024):.1f} MB e ultrapassa o limite configurado "
-                f"de {MAX_FILE_MB} MB. Reduza a qualidade ou use um servidor Bot API local."
+            raise DownloadTooLarge(
+                f"O arquivo tem {size / (1024*1024):.1f} MB e ultrapassa o limite de "
+                f"{MAX_FILE_MB} MB. Reduza a qualidade ou use um servidor Bot API local."
             )
 
         title = (info.get("title") or path.name)[:900]
         await bot.send_chat_action(callback.message.chat.id, ChatAction.UPLOAD_DOCUMENT)
         if mode == "audio":
             await callback.message.answer_audio(
-             audio=FSInputFile(path),
-             title=title,
-             caption=f"🎵 {title}"
+                audio=FSInputFile(path),
+                title=title,
+                caption=f"🎵 {title}",
             )
         else:
             # Envia como documento para preservar o arquivo sem recodificação do Telegram.
             await callback.message.answer_document(
-             document=FSInputFile(path), caption=f"🎬 {title}"
+                document=FSInputFile(path), caption=f"🎬 {title}"
             )
         await callback.message.answer("Pronto. Pode mandar outro link.")
-    except Exception as exc:
+    except DownloadTooLarge as exc:
+        await callback.message.answer(str(exc))
+    except Exception:
         log.exception("Falha no download")
-        await callback.message.answer(f"Não consegui concluir o download.\n\n{str(exc)[:900]}")
+        await callback.message.answer("Não consegui concluir o download. Confira o link e tente novamente.")
     finally:
-        pending.pop(key, None)
-        if path and path.exists():
+        if job_dir is not None:
             try:
-                path.unlink()
+                job_dir.cleanup()
             except OSError:
-                pass
+                log.exception("Falha ao limpar arquivos temporários do download")
         try:
             await callback.message.delete()
         except TelegramBadRequest:
-            pass
+            log.warning("Não foi possível remover a mensagem de status do download")
 
 
 async def main():
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    log.info("Bot iniciado. Usuários autorizados: %s", sorted(ALLOWED_USER_IDS))
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError("FFmpeg não encontrado no PATH. Instale-o antes de iniciar o bot.")
+    log.info("Bot iniciado. Quantidade de usuários autorizados: %d", len(ALLOWED_USER_IDS))
     await dp.start_polling(bot)
 
 
