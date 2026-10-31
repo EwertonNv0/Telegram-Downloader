@@ -39,6 +39,11 @@ ALLOWED_USER_IDS = {
     for value in os.getenv("ALLOWED_USER_IDS", "").split(",")
     if value.strip().isdigit()
 }
+ADMIN_USER_IDS = {
+    int(value.strip())
+    for value in os.getenv("ADMIN_USER_IDS", "").split(",")
+    if value.strip().isdigit()
+}
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "downloads")).resolve()
 TEMP_DIR_SETTING = os.getenv("TEMP_DIR", "").strip()
 TEMP_DIR = Path(TEMP_DIR_SETTING).resolve() if TEMP_DIR_SETTING else DOWNLOAD_DIR
@@ -70,6 +75,7 @@ TELEGRAM_UPLOAD_MAX_ATTEMPTS = 3
 TELEGRAM_UPLOAD_RETRY_BASE_SECONDS = 2
 DOWNLOAD_CLEANUP_MAX_ATTEMPTS = 4
 DOWNLOAD_CLEANUP_RETRY_BASE_SECONDS = 0.25
+RESTART_EXIT_CODE = 75
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("media-bot")
@@ -100,6 +106,7 @@ URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 pending: dict[tuple[int, int], tuple[str, float]] = {}
 active_download_dirs: set[Path] = set()
 active_download_dirs_lock = threading.Lock()
+restart_requested = False
 
 
 class DownloadTooLarge(Exception):
@@ -351,13 +358,16 @@ def keyboard():
 
 @dp.message(CommandStart())
 async def start(message: Message):
-    if not is_authorized(message.from_user.id if message.from_user else None):
+    user_id = message.from_user.id if message.from_user else None
+    if not is_authorized(user_id):
         await message.answer("Acesso restrito. Peça ao administrador para liberar seu ID.")
         return
+    commands = "Comandos: /id mostra seu ID; /help mostra esta mensagem."
+    if user_id in ADMIN_USER_IDS:
+        commands += " /reiniciar reinicia o bot."
     await message.answer(
         "Envie um link público de vídeo ou áudio.\n"
-        "Vou analisar o conteúdo e mostrar as opções de download.\n\n"
-        "Comandos: /id mostra seu ID; /help mostra esta mensagem."
+        f"Vou analisar o conteúdo e mostrar as opções de download.\n\n{commands}"
     )
 
 
@@ -370,6 +380,26 @@ async def show_id(message: Message):
 @dp.message(Command("help"))
 async def help_cmd(message: Message):
     await start(message)
+
+
+@dp.message(Command("reiniciar"))
+async def restart_bot(message: Message):
+    global restart_requested
+    user_id = message.from_user.id if message.from_user else None
+    if user_id not in ADMIN_USER_IDS:
+        await message.answer("Você não tem permissão para reiniciar o bot.")
+        return
+    if restart_requested:
+        await message.answer("O bot já está reiniciando.")
+        return
+
+    restart_requested = True
+    try:
+        await message.answer("Reiniciando o bot...")
+    except Exception:
+        restart_requested = False
+        raise
+    asyncio.create_task(dp.stop_polling())
 
 
 @dp.message(F.text)
@@ -510,6 +540,8 @@ async def main():
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     if not shutil.which("ffmpeg"):
         raise RuntimeError("FFmpeg não encontrado no PATH. Instale-o antes de iniciar o bot.")
+    if not ADMIN_USER_IDS:
+        log.warning("ADMIN_USER_IDS não configurado; o comando /reiniciar ficará desabilitado")
     cleanup_stale_downloads()
     log.info("Bot iniciado. Quantidade de usuários autorizados: %d", len(ALLOWED_USER_IDS))
     cleanup_task = asyncio.create_task(cleanup_stale_downloads_periodically())
@@ -525,3 +557,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    if restart_requested:
+        raise SystemExit(RESTART_EXIT_CODE)

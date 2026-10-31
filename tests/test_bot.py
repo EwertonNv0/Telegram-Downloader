@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 os.environ["BOT_TOKEN"] = "123456:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 os.environ["ALLOWED_USER_IDS"] = "123456789"
+os.environ["ADMIN_USER_IDS"] = "123456789"
 
 import bot
 
@@ -50,6 +51,37 @@ class ValidateUrlTests(unittest.TestCase):
 
 
 class ConfigurationAndDownloadTests(unittest.TestCase):
+    def test_only_admin_can_restart_bot(self):
+        async def run_restart():
+            message = MagicMock()
+            message.from_user.id = 123456789
+            message.answer = AsyncMock()
+            bot.restart_requested = False
+            with patch.object(bot.dp, "stop_polling", new_callable=AsyncMock) as stop_polling:
+                await bot.restart_bot(message)
+                await asyncio.sleep(0)
+                message.answer.assert_awaited_once_with("Reiniciando o bot...")
+                stop_polling.assert_awaited_once_with()
+            bot.restart_requested = False
+
+        asyncio.run(run_restart())
+
+    def test_non_admin_cannot_restart_bot(self):
+        async def run_restart():
+            message = MagicMock()
+            message.from_user.id = 987654321
+            message.answer = AsyncMock()
+            bot.restart_requested = False
+            with patch.object(bot.dp, "stop_polling", new_callable=AsyncMock) as stop_polling:
+                await bot.restart_bot(message)
+                message.answer.assert_awaited_once_with(
+                    "Você não tem permissão para reiniciar o bot."
+                )
+                stop_polling.assert_not_awaited()
+            bot.restart_requested = False
+
+        asyncio.run(run_restart())
+
     def test_file_size_configuration_must_be_positive_integer(self):
         self.assertEqual(bot.parse_max_file_mb("49"), 49)
         for value in ("0", "-1", "invalid"):

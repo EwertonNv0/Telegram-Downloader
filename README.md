@@ -15,8 +15,9 @@ Bot privado de Telegram para analisar links e baixar áudio MP3 ou vídeo usando
 1. Copie `.env.example` para `.env`.
 2. Coloque o token do BotFather em `BOT_TOKEN`.
 3. Coloque os IDs permitidos em `ALLOWED_USER_IDS`, separados por vírgula.
-4. Instale o FFmpeg e confirme que `ffmpeg -version` funciona no terminal.
-5. Execute `start.bat`.
+4. Coloque em `ADMIN_USER_IDS` os IDs que podem reiniciar o bot, separados por vírgula. Esse valor pode ser igual ou diferente de `ALLOWED_USER_IDS`.
+5. Instale o FFmpeg e confirme que `ffmpeg -version` funciona no terminal.
+6. Execute `start.bat`.
 
 Na primeira execução, o script cria o ambiente virtual e instala as dependências fixadas em `requirements.txt`. Valide o projeto antes de atualizar essas versões.
 
@@ -25,6 +26,8 @@ Na primeira execução, o script cria o ambiente virtual e instala as dependênc
 O token que constava no arquivo de exemplo anterior deve ser revogado no BotFather, mesmo que o arquivo tenha sido removido do diretório. Se o repositório foi compartilhado, remova também o segredo do histórico Git antes de compartilhá-lo novamente.
 
 Cada pessoa deve abrir o bot e enviar `/id`. O administrador adiciona o número recebido em `ALLOWED_USER_IDS` no `.env` e reinicia o bot.
+
+Administradores listados em `ADMIN_USER_IDS` podem enviar `/reiniciar` no chat. O comando reinicia o processo do bot por meio do `start.bat`, mantendo a mesma janela aberta e recarregando as configurações. Usuários comuns não podem executá-lo. Se houver um download em andamento, o Python pode aguardar a tarefa em background terminar antes de relançar o processo.
 
 Não compartilhe o token do bot. Se ele vazar, gere outro pelo BotFather.
 

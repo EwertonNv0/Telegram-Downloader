@@ -8,8 +8,12 @@ if not exist .venv (
 if not exist ".venv\Scripts\python.exe" goto failed
 ".venv\Scripts\python.exe" -m pip install -r requirements.txt
 if errorlevel 1 goto failed
+
+:run
 ".venv\Scripts\python.exe" bot.py
-if errorlevel 1 goto failed
+set "BOT_EXIT_CODE=%ERRORLEVEL%"
+if "%BOT_EXIT_CODE%"=="75" goto run
+if not "%BOT_EXIT_CODE%"=="0" goto failed
 goto finished
 
 :failed
